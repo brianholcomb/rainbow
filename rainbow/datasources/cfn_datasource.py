@@ -18,7 +18,7 @@ class CfnDataSourceBase(DataSourceBase):
         if not cfn_connection:
             raise Exception('Invalid region %r' % (region,))
 
-        self.stack = cfn_connection.describe_stack(stack_name)
+        self.stack = cfn_connection.get_stack(stack_name)
 
 
 class CfnOutputsDataSource(CfnDataSourceBase):
@@ -27,7 +27,7 @@ class CfnOutputsDataSource(CfnDataSourceBase):
     def __init__(self, data_source):
         super(CfnOutputsDataSource, self).__init__(data_source)
 
-        self.data = {i.key: i.value for i in self.stack.outputs}
+        self.data = {i.get('OutputKey'): i.get('OutputValue') for i in self.stack.outputs}
 
 
 class CfnResourcesDataSource(CfnDataSourceBase):
@@ -36,7 +36,7 @@ class CfnResourcesDataSource(CfnDataSourceBase):
     def __init__(self, data_source):
         super(CfnResourcesDataSource, self).__init__(data_source)
 
-        self.data = {r.logical_resource_id: r.physical_resource_id for r in self.stack.describe_resources()}
+        self.data = {r.logical_resource_id: r.physical_resource_id for r in self.stack.resource_summaries.all()}
 
 
 class CfnParametersDataSource(CfnDataSourceBase):
@@ -45,5 +45,5 @@ class CfnParametersDataSource(CfnDataSourceBase):
     def __init__(self, data_source):
         super(CfnParametersDataSource, self).__init__(data_source)
         
-        self.data = {p.key: p.value for p in self.stack.parameters}
+        self.data = {p.get('ParameterKey'): p.get('ParameterValue') for p in self.stack.parameters}
         

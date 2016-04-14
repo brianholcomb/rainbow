@@ -8,7 +8,7 @@ setup(
     author_email='omrib@everything.me',
     url='http://github.com/EverythingMe/rainbow',
     packages=find_packages(),
-    install_requires=['boto', 'PyYAML'],
+    install_requires=['boto3', 'PyYAML'],
 
     extras_require={
         'test': ['nose', 'coverage', 'mock']

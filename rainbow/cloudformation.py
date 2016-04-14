@@ -1,23 +1,7 @@
 import time
 import json
-import itertools
-import boto.cloudformation
-import boto.exception
-
-
-def boto_all(func, *args, **kwargs):
-    """
-    Iterate through all boto next_token's
-    """
-
-    ret = [func(*args, **kwargs)]
-
-    while ret[-1].next_token:
-        kwargs['next_token'] = ret[-1].next_token
-        ret.append(func(*args, **kwargs))
-
-    # flatten it by 1 level
-    return list(reduce(itertools.chain, ret))
+import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 
 class StackStatus(str):
@@ -53,10 +37,12 @@ class Cloudformation(object):
         :type region: str
         """
 
-        self.connection = boto.cloudformation.connect_to_region(region or Cloudformation.default_region)
+        self.client = boto3.client('cloudformation', region_name=region or Cloudformation.default_region)
 
-        if not self.connection:
-            raise CloudformationException('Invalid region %s' % (region or Cloudformation.default_region,))
+        try:
+            self.client.describe_account_limits()
+        except EndpointConnectionError:
+            raise CloudformationException('Invalid region %s' % (self.client.meta.region_name))
 
     @staticmethod
     def resolve_template_parameters(template, datasource_collection):
@@ -70,7 +56,7 @@ class Cloudformation(object):
         :return: parameters parameter for update_stack() or create_stack()
         """
 
-        parameters = {}
+        parameters = []
         for parameter, parameter_definition in template.get('Parameters', {}).iteritems():
             if 'Default' in parameter_definition and not parameter in datasource_collection:
                 parameter_value = parameter_definition['Default']
@@ -80,7 +66,7 @@ class Cloudformation(object):
                 if hasattr(parameter_value, '__iter__'):
                     parameter_value = ','.join(map(str, parameter_value))
 
-            parameters[parameter] = parameter_value
+            parameters.append({'ParameterKey': str(parameter), 'ParameterValue': str(parameter_value)})
 
         return parameters
 
@@ -93,10 +79,16 @@ class Cloudformation(object):
         :rtype: bool
         """
 
+        stacks = []
         # conserve bandwidth (and API calls) by not listing any stacks in DELETE_COMPLETE state
-        active_stacks = boto_all(self.connection.list_stacks, [state for state in Cloudformation.VALID_STACK_STATUSES
-                                                               if state != 'DELETE_COMPLETE'])
-        return name in [stack.stack_name for stack in active_stacks if stack.stack_status]
+        responses = self.client.get_paginator('list_stacks').paginate(
+            StackStatusFilter=[status for status in Cloudformation.VALID_STACK_STATUSES if status != 'DELETE_COMPLETE'])
+        try:
+            for response in responses:
+                stacks+=[stack['StackName'] for stack in response['StackSummaries']]
+        except ClientError as ex:
+            raise CloudformationException(ex.message)
+        return name in stacks
 
     def update_stack(self, name, template, parameters):
         """
@@ -113,14 +105,14 @@ class Cloudformation(object):
         """
 
         try:
-            self.connection.update_stack(name, json.dumps(template), disable_rollback=True,
-                                         parameters=parameters.items(), capabilities=['CAPABILITY_IAM'])
-        except boto.exception.BotoServerError, ex:
+            self.client.update_stack(StackName=name, TemplateBody=json.dumps(template),
+                                         Parameters=parameters, Capabilities=['CAPABILITY_IAM'])
+        except ClientError as ex:
             if ex.message == 'No updates are to be performed.':
                 # this is not really an error, but there aren't any updates.
                 return False
             else:
-                raise CloudformationException('error occured while updating stack %s: %s' % (name, ex.message))
+                raise CloudformationException(ex.message)
         else:
             return True
 
@@ -137,9 +129,9 @@ class Cloudformation(object):
         """
 
         try:
-            self.connection.create_stack(name, json.dumps(template), disable_rollback=True,
-                                         parameters=parameters.items(), capabilities=['CAPABILITY_IAM'])
-        except boto.exception.BotoServerError, ex:
+            self.client.create_stack(StackName=name, TemplateBody=json.dumps(template), DisableRollback=True,
+                                         Parameters=parameters, Capabilities=['CAPABILITY_IAM'])
+        except ClientError as ex:
             raise CloudformationException('error occured while creating stack %s: %s' % (name, ex.message))
 
     def describe_stack_events(self, name):
@@ -152,9 +144,17 @@ class Cloudformation(object):
         :rtype: list of boto.cloudformation.stack.StackEvent
         """
 
-        return boto_all(self.connection.describe_stack_events, name)
+        events = []
+        responses = self.client.get_paginator('describe_stack_events').paginate(StackName=name)
+        try:
+            for response in responses:
+                events+=[event for event in response['StackEvents']]
+        except ClientError as ex:
+            raise CloudformationException(ex.message)
 
-    def describe_stack(self, name):
+        return events
+
+    def get_stack(self, name):
         """
         Describe CFN stack
 
@@ -163,7 +163,10 @@ class Cloudformation(object):
         :rtype: boto.cloudformation.stack.Stack
         """
 
-        return self.connection.describe_stacks(name)[0]
+        try:
+            return boto3.resource('cloudformation', region_name=self.client.meta.region_name).Stack(name)
+        except ClientError as ex:
+            raise CloudformationException(ex.message)
 
     def tail_stack_events(self, name, initial_entry=None):
         """
@@ -204,27 +207,27 @@ class Cloudformation(object):
         previous_stack_events = initial_entry
 
         while True:
-            stack = self.describe_stack(name)
+            stack = self.client.describe_stacks(StackName=name)['Stacks'][0]
             stack_events = self.describe_stack_events(name)
 
             if len(stack_events) > previous_stack_events:
                 # iterate on all new events, at reversed order (the list is sorted from newest to oldest)
                 for event in stack_events[:-previous_stack_events or None][::-1]:
-                    yield {'resource_type': event.resource_type,
-                           'logical_resource_id': event.logical_resource_id,
-                           'physical_resource_id': event.physical_resource_id,
-                           'resource_status': event.resource_status,
-                           'resource_status_reason': event.resource_status_reason,
-                           'timestamp': event.timestamp}
+                    yield {'resource_type': event.get('ResourceType'),
+                           'logical_resource_id': event.get('LogicalResourceId'),
+                           'physical_resource_id': event.get('PhysicalResourceId'),
+                           'resource_status': event.get('ResourceStatus'),
+                           'resource_status_reason': event.get('ResourceStatusReason'),
+                           'timestamp': event.get('Timestamp')}
 
                 previous_stack_events = len(stack_events)
 
-            if stack.stack_status.endswith('_FAILED') or \
-                    stack.stack_status in ('ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'):
-                yield StackFailStatus(stack.stack_status)
+            if stack['StackStatus'].endswith('_FAILED') or \
+                    stack['StackStatus'] in ('ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'):
+                yield StackFailStatus(stack['StackStatus'])
                 break
-            elif stack.stack_status.endswith('_COMPLETE'):
-                yield StackSuccessStatus(stack.stack_status)
+            elif stack['StackStatus'].endswith('_COMPLETE'):
+                yield StackSuccessStatus(stack['StackStatus'])
                 break
 
-            time.sleep(2)
+            time.sleep(5)

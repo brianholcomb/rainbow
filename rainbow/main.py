@@ -15,7 +15,8 @@ def main():  # pragma: no cover
 
     # boto logs errors in addition to throwing exceptions. on rainbow.cloudformation.Cloudformation.update_stack()
     # I'm ignoring the 'No updates are to be performed.' exception, so I don't want it to be logged.
-    logging.getLogger('boto').setLevel(logging.CRITICAL)
+    logging.getLogger('botocore').setLevel(logging.CRITICAL)
+    logging.getLogger('boto3').setLevel(logging.CRITICAL)
 
     logger = logging.getLogger('rainbow')
 
